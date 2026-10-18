@@ -33,6 +33,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as SqlError from "effect/sql/SqlError";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -2241,4 +2242,124 @@ layer("ProviderEventIngestorV2", (it) => {
       );
     }),
   );
+});
+
+const lockTimeoutWriteError = new EventSink.EventSinkWriteError({
+  eventCount: 1,
+  cause: new SqlError.SqlError({
+    reason: new SqlError.LockTimeoutError({
+      cause: new Error("database is locked"),
+      message: "database is locked",
+    }),
+  }),
+});
+
+/** The ingestor sees an event sink whose next writes fail with `errors`, in order. */
+function layerFailingNextWrites(errors: ReadonlyArray<EventSink.EventSinkV2Error>) {
+  const attempts = { count: 0 };
+  const layerFailingEventSink = Layer.effect(
+    EventSink.EventSinkV2,
+    Effect.gen(function* () {
+      const eventSink = yield* EventSink.EventSinkV2;
+      return EventSink.EventSinkV2.of({
+        ...eventSink,
+        write: (input) =>
+          Effect.suspend(() => {
+            const error = errors[attempts.count];
+            attempts.count += 1;
+            return error === undefined ? eventSink.write(input) : Effect.fail(error);
+          }),
+      });
+    }),
+  ).pipe(Layer.provide(layerTestEventSink));
+  const layer = Layer.mergeAll(
+    layerTestDatabase,
+    layerTestStores,
+    layerTestEventSink,
+    IdAllocator.layer,
+    ProviderEventIngestor.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          layerTestStores,
+          layerFailingEventSink,
+          IdAllocator.layer,
+          ThreadCommandExecutor.layer,
+          layerGit,
+        ),
+      ),
+    ),
+  );
+  return { attempts, layer };
+}
+
+const ingestCompletedProviderTurn = Effect.gen(function* () {
+  const now = yield* DateTime.now;
+  const eventSink = yield* EventSink.EventSinkV2;
+  const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+  const idAllocator = yield* IdAllocator.IdAllocatorV2;
+  const threadEvent = yield* threadCreatedEvent(now);
+  yield* eventSink.write({ events: [threadEvent] });
+  const providerSessionId = yield* idAllocator.allocate.providerSession({
+    providerInstanceId: modelSelection.instanceId,
+    threadId: threadEvent.threadId,
+  });
+  return yield* ingestor.ingestNormalized({
+    providerSessionId,
+    providerInstanceId: modelSelection.instanceId,
+    threadId: threadEvent.threadId,
+    event: {
+      type: "provider_turn.updated",
+      driver: CODEX_DRIVER,
+      providerTurn: {
+        id: idAllocator.derive.providerTurn({ driver: CODEX_DRIVER, nativeTurnId: "locked-turn" }),
+        providerThreadId: idAllocator.derive.providerThread({
+          driver: CODEX_DRIVER,
+          nativeThreadId: "locked-thread",
+        }),
+        nodeId: NodeId.make("node:locked-turn"),
+        runAttemptId: null,
+        nativeTurnRef: null,
+        ordinal: 1,
+        status: "completed",
+        startedAt: now,
+        completedAt: now,
+      },
+    },
+  });
+});
+
+it.effect("retries a provider event write that timed out on the database lock", () => {
+  const { attempts, layer } = layerFailingNextWrites([
+    lockTimeoutWriteError,
+    lockTimeoutWriteError,
+  ]);
+  return Effect.gen(function* () {
+    const stored = yield* ingestCompletedProviderTurn;
+    assert.equal(attempts.count, 3);
+    assert.isNotEmpty(stored);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("fails a provider event write that stays locked after its retries", () => {
+  const { attempts, layer } = layerFailingNextWrites([
+    lockTimeoutWriteError,
+    lockTimeoutWriteError,
+    lockTimeoutWriteError,
+  ]);
+  return Effect.gen(function* () {
+    const error = yield* Effect.flip(ingestCompletedProviderTurn);
+    assert.equal(attempts.count, 3);
+    assert.equal(error._tag, "ProviderEventPublishError");
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("does not retry a provider event write that failed for another reason", () => {
+  const { attempts, layer } = layerFailingNextWrites([
+    new EventSink.EventSinkWriteError({ eventCount: 1, cause: new Error("constraint failed") }),
+  ]);
+  return Effect.gen(function* () {
+    const error = yield* Effect.flip(ingestCompletedProviderTurn);
+    assert.equal(attempts.count, 1);
+    assert.equal(error._tag, "ProviderEventPublishError");
+  }).pipe(Effect.provide(layer));
 });
