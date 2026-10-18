@@ -1015,7 +1015,9 @@ export const layer: Layer.Layer<
             });
           // Failing the run on an ingest error does not end the provider's
           // turn. Stop it, or it keeps running tools nobody sees, and the
-          // thread's next turn is refused while it is still active.
+          // thread's next turn is refused while it is still active. Bounded,
+          // because it runs as a finalizer: a provider that never answers
+          // would otherwise hold the ingestion fiber forever.
           const stopOrphanedProviderTurn = Effect.gen(function* () {
             const providerTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
             if (providerTurnId === null) {
@@ -1026,6 +1028,7 @@ export const layer: Layer.Layer<
               providerTurnId,
             });
           }).pipe(
+            Effect.timeout("15 seconds"),
             Effect.catchCause((cause) =>
               Effect.logWarning(
                 "orchestration V2 could not stop the provider turn after ingestion failed",

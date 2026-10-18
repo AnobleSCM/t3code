@@ -29,13 +29,16 @@ import {
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -3787,8 +3790,13 @@ it.effect("stops the provider turn when event ingestion fails before the root te
   }),
 );
 
-it.effect("still records the failed run when stopping the orphaned provider turn fails", () =>
-  Effect.gen(function* () {
+it.effect("still records the failed run when stopping the orphaned provider turn fails", () => {
+  const logged: Array<unknown> = [];
+  const logger = Logger.make(({ message }) => {
+    logged.push(Array.isArray(message) ? message[0] : message);
+  });
+  return Effect.gen(function* () {
+    const attempts = yield* Ref.make(0);
     const { observed } = yield* captureRootRunTermination({
       key: "ingest-failure:interrupt-error",
       shouldFinalizeRun: () => Effect.succeed(true),
@@ -3796,15 +3804,43 @@ it.effect("still records the failed run when stopping the orphaned provider turn
         Stream.make(runningRootProviderTurnEvent(ids)).pipe(Stream.concat(Stream.never)),
       ingestNormalized: failedEventWrite,
       interruptTurn: (request) =>
-        Effect.fail(
-          new ProviderAdapter.ProviderAdapterInterruptError({
-            driver,
-            providerThreadId: request.providerThread.id,
-            providerTurnId: request.providerTurnId,
-            cause: "no live query",
-          }),
+        Ref.update(attempts, (count) => count + 1).pipe(
+          Effect.andThen(
+            Effect.fail(
+              new ProviderAdapter.ProviderAdapterInterruptError({
+                driver,
+                providerThreadId: request.providerThread.id,
+                providerTurnId: request.providerTurnId,
+                cause: "no live query",
+              }),
+            ),
+          ),
         ),
     });
+    assert.deepEqual(observed, ["run:failed", "pull-requests-refreshed"]);
+    assert.equal(yield* Ref.get(attempts), 1);
+    assert.include(
+      logged,
+      "orchestration V2 could not stop the provider turn after ingestion failed",
+    );
+  }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+});
+
+it.effect("gives up on stopping an orphaned provider turn that never answers", () =>
+  Effect.gen(function* () {
+    const interruptStarted = yield* Deferred.make<void>();
+    const capture = yield* captureRootRunTermination({
+      key: "ingest-failure:interrupt-hangs",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: (ids) =>
+        Stream.make(runningRootProviderTurnEvent(ids)).pipe(Stream.concat(Stream.never)),
+      ingestNormalized: failedEventWrite,
+      interruptTurn: () =>
+        Deferred.succeed(interruptStarted, undefined).pipe(Effect.andThen(Effect.never)),
+    }).pipe(Effect.forkChild);
+    yield* Deferred.await(interruptStarted);
+    yield* TestClock.adjust("15 seconds");
+    const { observed } = yield* Fiber.join(capture);
     assert.deepEqual(observed, ["run:failed", "pull-requests-refreshed"]);
   }),
 );
