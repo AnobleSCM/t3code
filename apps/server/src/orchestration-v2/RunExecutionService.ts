@@ -1013,6 +1013,26 @@ export const layer: Layer.Layer<
               }
               yield* Ref.set(rootRunFinalized, true);
             });
+          // Failing the run on an ingest error does not end the provider's
+          // turn. Stop it, or it keeps running tools nobody sees, and the
+          // thread's next turn is refused while it is still active.
+          const stopOrphanedProviderTurn = Effect.gen(function* () {
+            const providerTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
+            if (providerTurnId === null) {
+              return;
+            }
+            yield* input.session.interruptTurn({
+              providerThread: yield* Ref.get(latestProviderThread),
+              providerTurnId,
+            });
+          }).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning(
+                "orchestration V2 could not stop the provider turn after ingestion failed",
+                { runId: input.run.id, cause },
+              ),
+            ),
+          );
           const trackChildLifecycle = (
             event: ProviderAdapter.ProviderAdapterV2Event,
             deliverable: boolean,
@@ -1340,6 +1360,7 @@ export const layer: Layer.Layer<
                                   ),
                                 ),
                               ),
+                              Effect.ensuring(stopOrphanedProviderTurn),
                             ),
                       ),
                       Effect.mapError(
