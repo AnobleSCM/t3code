@@ -29,6 +29,7 @@ import {
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -37,6 +38,7 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -3914,6 +3916,30 @@ it.effect("stops a turn that started while ingestion failed once the provider na
   }),
 );
 
+it.effect("closes failed ingestion while the provider start remains pending", () =>
+  Effect.gen(function* () {
+    const runFailed = yield* Deferred.make<void>();
+    const subscriptionClosed = yield* Deferred.make<void>();
+    const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+    const ids = backgroundScenarioIds("ingest-failure:pending-start");
+    const capture = yield* captureRootRunTermination({
+      key: "ingest-failure:pending-start",
+      attemptProviderTurnId: null,
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: () => Stream.fromQueue(events),
+      ingestNormalized: failedEventWrite,
+      refreshAfterTurn: Deferred.succeed(runFailed, undefined).pipe(Effect.asVoid),
+      onEventSubscriptionClose: Deferred.succeed(subscriptionClosed, undefined).pipe(Effect.asVoid),
+      startTurn: () =>
+        Queue.offer(events, rootProviderThreadEvent(ids)).pipe(Effect.andThen(Effect.never)),
+    }).pipe(Effect.forkChild);
+    yield* Deferred.await(runFailed);
+    yield* TestClock.adjust("15 seconds");
+    yield* Deferred.await(subscriptionClosed);
+    yield* Fiber.interrupt(capture);
+  }),
+);
+
 it.effect("leaves the provider turn alone when ingestion fails after the run changed hands", () =>
   Effect.gen(function* () {
     const interrupts = yield* Ref.make(0);
@@ -4046,6 +4072,7 @@ function captureRootRunTermination(input: {
   readonly interruptTurn?: ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptTurn"];
   readonly ingestNormalized?: ProviderEventIngestor.ProviderEventIngestorV2["Service"]["ingestNormalized"];
   readonly refreshAfterTurn?: Effect.Effect<void>;
+  readonly onEventSubscriptionClose?: Effect.Effect<void>;
   readonly shouldStartProviderTurn?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["shouldStartProviderTurn"];
   readonly appContext?: ReturnType<McpAppModelContext.McpAppModelContext["Service"]["forThread"]>;
 }) {
@@ -4167,7 +4194,9 @@ function captureRootRunTermination(input: {
                   : []),
                 rootTerminalEvent(ids, "interrupted"),
               ] satisfies ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>),
-            close: Deferred.succeed(ingestionDone, undefined),
+            close: Deferred.succeed(ingestionDone, undefined).pipe(
+              Effect.andThen(input.onEventSubscriptionClose ?? Effect.void),
+            ),
           }),
           startTurn: input.startTurn ?? (() => Effect.void),
           interruptTurn: input.interruptTurn ?? (() => Effect.void),

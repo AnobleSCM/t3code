@@ -1120,9 +1120,23 @@ export const layer: Layer.Layer<
               ),
             );
           const settleIngestionFailure = (awaitRootTurn: boolean) =>
-            Ref.update(ingestionState, (state): IngestionState =>
-              awaitRootTurn && state === "failing" ? "awaiting-root-turn" : "settled",
-            );
+            Effect.gen(function* () {
+              const waiting = yield* Ref.modify(
+                ingestionState,
+                (state): readonly [boolean, IngestionState] =>
+                  awaitRootTurn && state === "failing"
+                    ? [true, "awaiting-root-turn"]
+                    : [false, "settled"],
+              );
+              if (waiting) {
+                // Start may never return, so the wait owns its deadline.
+                yield* Effect.sleep("15 seconds").pipe(
+                  Effect.andThen(claimOrphanWatch),
+                  Effect.flatMap((claimed) => (claimed ? eventSubscription.close : Effect.void)),
+                  Effect.forkDetach,
+                );
+              }
+            });
           const trackChildLifecycle = (
             event: ProviderAdapter.ProviderAdapterV2Event,
             deliverable: boolean,
@@ -1608,18 +1622,6 @@ export const layer: Layer.Layer<
               ),
             ),
           );
-          // Ingestion failed while the start was in flight. The provider names
-          // the turn right after accepting it; a wait past that is a provider
-          // that will never do so, and must not pin the subscription.
-          if ((yield* Ref.get(ingestionState)) !== "live") {
-            yield* Effect.sleep("15 seconds").pipe(
-              Effect.andThen(claimOrphanWatch),
-              Effect.flatMap((claimed) =>
-                claimed ? Fiber.interrupt(providerEventFiber) : Effect.void,
-              ),
-              Effect.forkDetach,
-            );
-          }
         }),
     } satisfies RunExecutionServiceV2Shape);
   }),
