@@ -19,17 +19,19 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   PlanId,
-  type ProviderThreadId,
+  ProviderThreadId,
   ProviderTurnId,
   RunAttemptId,
   RunId,
   RuntimeRequestId,
   TurnItemId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -69,25 +71,27 @@ const layerGit = GitVcsDriver.layer.pipe(
   Layer.provideMerge(NodeServices.layer),
 );
 
-const layerTest = Layer.mergeAll(
-  layerTestDatabase,
-  layerTestStores,
-  layerTestEventSink,
-  IdAllocator.layer,
-  ThreadCommandExecutor.layer,
-  layerGit,
-  ProviderEventIngestor.layer.pipe(
-    Layer.provide(
-      Layer.mergeAll(
-        layerTestStores,
-        layerTestEventSink,
-        IdAllocator.layer,
-        ThreadCommandExecutor.layer,
-        layerGit,
+const makeLayerTest = <E>(ingestorEventSink: Layer.Layer<EventSink.EventSinkV2, E>) =>
+  Layer.mergeAll(
+    layerTestDatabase,
+    layerTestStores,
+    layerTestEventSink,
+    IdAllocator.layer,
+    ThreadCommandExecutor.layer,
+    layerGit,
+    ProviderEventIngestor.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          layerTestStores,
+          ingestorEventSink,
+          IdAllocator.layer,
+          ThreadCommandExecutor.layer,
+          layerGit,
+        ),
       ),
     ),
-  ),
-);
+  );
+const layerTest = makeLayerTest(layerTestEventSink);
 
 const makeSharedWorktree = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
@@ -2244,122 +2248,120 @@ layer("ProviderEventIngestorV2", (it) => {
   );
 });
 
-const lockTimeoutWriteError = new EventSink.EventSinkWriteError({
+// EventSink reports a lock that outlasted busy_timeout at BEGIN IMMEDIATE this way.
+const lockTimeout = new EventSink.EventSinkWriteError({
   eventCount: 1,
-  cause: new SqlError.SqlError({
-    reason: new SqlError.LockTimeoutError({
-      cause: new Error("database is locked"),
-      message: "database is locked",
-    }),
-  }),
+  cause: new SqlError.SqlError({ reason: new SqlError.LockTimeoutError({ cause: null }) }),
+});
+const constraintFailure = new EventSink.EventSinkWriteError({
+  eventCount: 1,
+  cause: new SqlError.SqlError({ reason: new SqlError.ConstraintError({ cause: null }) }),
 });
 
-/** The ingestor sees an event sink whose next writes fail with `errors`, in order. */
-function layerFailingNextWrites(errors: ReadonlyArray<EventSink.EventSinkV2Error>) {
-  const attempts = { count: 0 };
-  const layerFailingEventSink = Layer.effect(
-    EventSink.EventSinkV2,
-    Effect.gen(function* () {
-      const eventSink = yield* EventSink.EventSinkV2;
-      return EventSink.EventSinkV2.of({
-        ...eventSink,
-        write: (input) =>
-          Effect.suspend(() => {
-            const error = errors[attempts.count];
-            attempts.count += 1;
-            return error === undefined ? eventSink.write(input) : Effect.fail(error);
-          }),
-      });
-    }),
-  ).pipe(Layer.provide(layerTestEventSink));
-  const layer = Layer.mergeAll(
-    layerTestDatabase,
-    layerTestStores,
-    layerTestEventSink,
-    IdAllocator.layer,
-    ProviderEventIngestor.layer.pipe(
-      Layer.provide(
-        Layer.mergeAll(
-          layerTestStores,
-          layerFailingEventSink,
-          IdAllocator.layer,
-          ThreadCommandExecutor.layer,
-          layerGit,
-        ),
-      ),
-    ),
+/** The ingestor's next sink writes fail with `errors`, in order; later writes go through. */
+const layerFailingNextWrites = (errors: ReadonlyArray<EventSink.EventSinkWriteError>) =>
+  makeLayerTest(
+    Layer.effect(
+      EventSink.EventSinkV2,
+      Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const pending = [...errors];
+        const failNext = <A, R>(write: Effect.Effect<A, EventSink.EventSinkV2Error, R>) =>
+          Effect.suspend(() => pending.shift() ?? write);
+        return EventSink.EventSinkV2.of({
+          ...eventSink,
+          write: (input) => failNext(eventSink.write(input)),
+          writeIfRunCurrent: (input) => failNext(eventSink.writeIfRunCurrent(input)),
+          writeIfProviderThreadOwner: (input) =>
+            failNext(eventSink.writeIfProviderThreadOwner(input)),
+        });
+      }),
+    ).pipe(Layer.provide(layerTestEventSink)),
   );
-  return { attempts, layer };
-}
 
-const ingestCompletedProviderTurn = Effect.gen(function* () {
-  const now = yield* DateTime.now;
-  const eventSink = yield* EventSink.EventSinkV2;
-  const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
-  const idAllocator = yield* IdAllocator.IdAllocatorV2;
-  const threadEvent = yield* threadCreatedEvent(now);
-  yield* eventSink.write({ events: [threadEvent] });
-  const providerSessionId = yield* idAllocator.allocate.providerSession({
-    providerInstanceId: modelSelection.instanceId,
-    threadId: threadEvent.threadId,
-  });
-  return yield* ingestor.ingestNormalized({
-    providerSessionId,
-    providerInstanceId: modelSelection.instanceId,
-    threadId: threadEvent.threadId,
-    event: {
-      type: "provider_turn.updated",
-      driver: CODEX_DRIVER,
-      providerTurn: {
-        id: idAllocator.derive.providerTurn({ driver: CODEX_DRIVER, nativeTurnId: "locked-turn" }),
-        providerThreadId: idAllocator.derive.providerThread({
-          driver: CODEX_DRIVER,
-          nativeThreadId: "locked-thread",
+const ingestCompletedProviderTurn = (
+  guard: Pick<
+    Parameters<ProviderEventIngestor.ProviderEventIngestorV2Shape["ingestNormalized"]>[0],
+    "writeIfRunCurrent" | "writeIfProviderThreadOwner"
+  >,
+) =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const eventSink = yield* EventSink.EventSinkV2;
+    const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+    const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+    const idAllocator = yield* IdAllocator.IdAllocatorV2;
+    const threadEvent = yield* threadCreatedEvent(now);
+    yield* eventSink.write({ events: [threadEvent] });
+    const providerTurnId = ProviderTurnId.make("provider-turn:locked");
+    const exit = yield* ingestor
+      .ingestNormalized({
+        providerSessionId: yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId: threadEvent.threadId,
         }),
-        nodeId: NodeId.make("node:locked-turn"),
-        runAttemptId: null,
-        nativeTurnRef: null,
-        ordinal: 1,
-        status: "completed",
-        startedAt: now,
-        completedAt: now,
+        providerInstanceId: modelSelection.instanceId,
+        threadId: threadEvent.threadId,
+        event: {
+          type: "provider_turn.updated",
+          driver: CODEX_DRIVER,
+          providerTurn: {
+            id: providerTurnId,
+            providerThreadId: ProviderThreadId.make("provider-thread:locked"),
+            nodeId: NodeId.make("node:locked-turn"),
+            runAttemptId: null,
+            nativeTurnRef: null,
+            ordinal: 1,
+            status: "completed",
+            startedAt: now,
+            completedAt: now,
+          },
+        },
+        ...guard,
+      })
+      .pipe(Effect.exit);
+    const projection = yield* projectionStore.getThreadProjection(threadEvent.threadId);
+    return { exit, providerTurnId, persisted: projection.providerTurns.map((turn) => turn.id) };
+  });
+
+// Neither guard matches a stored run, so a guarded write commits nothing.
+const runId = RunId.make("run:locked");
+const activeAttemptId = RunAttemptId.make("attempt:locked");
+it.effect.each([
+  { route: "write", guard: {} },
+  {
+    route: "writeIfRunCurrent",
+    guard: { writeIfRunCurrent: { runId, activeAttemptId, expectedStatus: "running" } },
+  },
+  {
+    route: "writeIfProviderThreadOwner",
+    guard: {
+      writeIfProviderThreadOwner: {
+        providerThreadId: ProviderThreadId.make("provider-thread:locked"),
+        runId,
+        activeAttemptId,
+        expectedLastRunOrdinal: 1,
       },
     },
-  });
-});
+  },
+] as const)("a provider event $route outlasts a brief database lock", ({ route, guard }) =>
+  Effect.gen(function* () {
+    const { exit, providerTurnId, persisted } = yield* ingestCompletedProviderTurn(guard);
+    assert.isTrue(Exit.isSuccess(exit));
+    assert.deepEqual(persisted, route === "write" ? [providerTurnId] : []);
+  }).pipe(Effect.provide(layerFailingNextWrites([lockTimeout, lockTimeout]))),
+);
 
-it.effect("retries a provider event write that timed out on the database lock", () => {
-  const { attempts, layer } = layerFailingNextWrites([
-    lockTimeoutWriteError,
-    lockTimeoutWriteError,
-  ]);
-  return Effect.gen(function* () {
-    const stored = yield* ingestCompletedProviderTurn;
-    assert.equal(attempts.count, 3);
-    assert.isNotEmpty(stored);
-  }).pipe(Effect.provide(layer));
-});
-
-it.effect("fails a provider event write that stays locked after its retries", () => {
-  const { attempts, layer } = layerFailingNextWrites([
-    lockTimeoutWriteError,
-    lockTimeoutWriteError,
-    lockTimeoutWriteError,
-  ]);
-  return Effect.gen(function* () {
-    const error = yield* Effect.flip(ingestCompletedProviderTurn);
-    assert.equal(attempts.count, 3);
-    assert.equal(error._tag, "ProviderEventPublishError");
-  }).pipe(Effect.provide(layer));
-});
-
-it.effect("does not retry a provider event write that failed for another reason", () => {
-  const { attempts, layer } = layerFailingNextWrites([
-    new EventSink.EventSinkWriteError({ eventCount: 1, cause: new Error("constraint failed") }),
-  ]);
-  return Effect.gen(function* () {
-    const error = yield* Effect.flip(ingestCompletedProviderTurn);
-    assert.equal(attempts.count, 1);
-    assert.equal(error._tag, "ProviderEventPublishError");
-  }).pipe(Effect.provide(layer));
-});
+it.effect.each([
+  { failure: "stays locked", errors: [lockTimeout, lockTimeout, lockTimeout] },
+  { failure: "fails for another reason", errors: [constraintFailure] },
+])("fails a provider event write that $failure", ({ errors }) =>
+  Effect.gen(function* () {
+    const { exit, persisted } = yield* ingestCompletedProviderTurn({});
+    assert.instanceOf(
+      Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined,
+      ProviderEventIngestor.ProviderEventPublishError,
+    );
+    assert.isEmpty(persisted);
+  }).pipe(Effect.provide(layerFailingNextWrites(errors))),
+);
