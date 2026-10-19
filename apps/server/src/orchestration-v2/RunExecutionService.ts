@@ -639,7 +639,7 @@ export const layer: Layer.Layer<
               yield* input.refreshAfterTurn;
             }
           }
-          return;
+          return false;
         }
         const allocateEventId = () => idAllocator.allocate.event({ threadId: input.run.threadId });
         const open = input.openRunOwnedSubagents ?? emptyOpenRunOwnedSubagentProjection();
@@ -810,12 +810,13 @@ export const layer: Layer.Layer<
             effects: finalization.effects,
           });
           if (!result.committed) {
-            return;
+            return false;
           }
         } else {
           yield* eventSink.writeWithEffects(finalization);
         }
         yield* input.refreshAfterTurn;
+        return true;
       });
 
     return RunExecutionServiceV2.of({
@@ -1025,30 +1026,103 @@ export const layer: Layer.Layer<
               }
               yield* Ref.set(rootRunFinalized, true);
             });
-          // Failed ingestion leaves the provider running. Use a hard stop because
-          // a settled Grok prompt can retain background work after a soft interrupt.
-          // Bound the finalizer so an unresponsive provider cannot hold it open.
-          const providerTurnOrphaned = yield* Ref.make(false);
-          const stopOrphanedProviderTurn = Effect.gen(function* () {
-            yield* Ref.set(providerTurnOrphaned, true);
-            const providerTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
-            if (providerTurnId === null) {
-              return;
-            }
-            yield* input.session.interruptTurn({
-              providerThread: yield* Ref.get(latestProviderThread),
-              providerTurnId,
-              requestRuntimeRestart: true,
-            });
-          }).pipe(
-            Effect.timeout("15 seconds"),
-            Effect.catchCause((cause) =>
-              Effect.logWarning(
-                "orchestration V2 could not stop the provider turn after ingestion failed",
-                { runId: input.run.id, cause },
+          // A failed event write fails the run, but the provider keeps running
+          // its turn. Adapters stop a turn only by the id the provider minted
+          // for it, which routing learns from the provider's own turn event.
+          // When the write fails before that event, the stream keeps routing
+          // without storing anything until the turn is named, then stops it.
+          type IngestionState =
+            | "live"
+            | "failing"
+            | "failing-start-declined"
+            | "awaiting-root-turn"
+            | "settled";
+          const ingestionState = yield* Ref.make<IngestionState>("live");
+          // Hard stop: a soft interrupt lets a settled Grok prompt keep its
+          // background work. Bounded so an unresponsive provider cannot hold
+          // the ingestion fiber.
+          const stopOrphanedProviderTurn = (providerTurnId: ProviderTurnId) =>
+            Ref.get(latestProviderThread).pipe(
+              Effect.flatMap((providerThread) =>
+                input.session.interruptTurn({
+                  providerThread,
+                  providerTurnId,
+                  requestRuntimeRestart: true,
+                }),
               ),
-            ),
+              Effect.timeout("15 seconds"),
+              Effect.catchCause((cause) =>
+                Effect.logWarning(
+                  "orchestration V2 could not stop the provider turn after ingestion failed",
+                  { runId: input.run.id, cause },
+                ),
+              ),
+            );
+          // The stop, a declined start, or the deadline ends the wait for the
+          // root turn; the claim makes sure only one of them acts.
+          const claimOrphanWatch = Ref.modify(
+            ingestionState,
+            (state): readonly [boolean, IngestionState] =>
+              state === "awaiting-root-turn" ? [true, "settled"] : [false, state],
           );
+          // Writes the failed run end and stops the root turn when its id is
+          // known. Resolves to whether the turn still has to be stopped once
+          // the provider names it.
+          const failIngestion = (cause: Cause.Cause<unknown>) =>
+            Effect.gen(function* () {
+              yield* Ref.set(ingestionState, "failing");
+              yield* Effect.logWarning("orchestration V2 provider event ingestion failed", {
+                runId: input.run.id,
+                cause,
+              });
+              if (yield* Ref.get(rootRunFinalized)) {
+                return false;
+              }
+              const committed = yield* writeFinalRunEvents({
+                run: input.run,
+                rootNode: input.rootNode,
+                checkpointScope: input.checkpointScope,
+                providerThread: yield* Ref.get(latestProviderThread),
+                attempt: input.attempt,
+                writeIfRunCurrent: {
+                  activeAttemptId: input.attempt.id,
+                  expectedStatus: "running",
+                },
+                openRunOwnedSubagents: yield* Ref.get(openRunOwnedSubagents),
+                terminal: makeFailedTerminalEvent(
+                  makeProviderFailure({
+                    cause: Cause.squash(cause),
+                    class: "unknown",
+                  }),
+                  (yield* Ref.get(latestTurnItemOrdinal)) + 1,
+                ),
+                failureItemPersisted: false,
+                refreshAfterTurn,
+              });
+              // A skipped write means a Stop or a newer attempt owns the run
+              // now, and the live turn with it.
+              if (!committed) {
+                return false;
+              }
+              const providerTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
+              if (providerTurnId === null) {
+                return true;
+              }
+              yield* stopOrphanedProviderTurn(providerTurnId);
+              return false;
+            }).pipe(
+              Effect.mapError(
+                (writeCause) =>
+                  new RunExecutionIngestError({
+                    runId: input.run.id,
+                    cause: { ingest: cause, write: writeCause },
+                  }),
+              ),
+            );
+          const settleIngestionFailure = (awaitRootTurn: boolean) =>
+            Ref.update(ingestionState, (state): IngestionState =>
+              awaitRootTurn && state === "failing" ? "awaiting-root-turn" : "settled",
+            );
           const trackChildLifecycle = (
             event: ProviderAdapter.ProviderAdapterV2Event,
             deliverable: boolean,
@@ -1244,6 +1318,17 @@ export const layer: Layer.Layer<
             ),
             Stream.tap((event) =>
               Effect.gen(function* () {
+                const state = yield* Ref.get(ingestionState);
+                if (state !== "live") {
+                  if (state !== "awaiting-root-turn") {
+                    return;
+                  }
+                  const providerTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
+                  if (providerTurnId !== null && (yield* claimOrphanWatch)) {
+                    yield* stopOrphanedProviderTurn(providerTurnId);
+                  }
+                  return;
+                }
                 let storedEventCount = 0;
                 const deliveredEvent = filterAssistantEvent(
                   event,
@@ -1327,15 +1412,31 @@ export const layer: Layer.Layer<
                   yield* finalizeRootRun(event);
                 }
                 yield* trackChildLifecycle(event, deliveredEvent !== null);
-              }),
+              }).pipe(
+                Effect.catchCauseIf(
+                  (cause) => !Cause.hasInterruptsOnly(cause),
+                  (cause) => failIngestion(cause).pipe(Effect.flatMap(settleIngestionFailure)),
+                ),
+              ),
             ),
-            Stream.takeUntilEffect(() => shouldStopProviderEventIngestion),
+            Stream.takeUntilEffect(() =>
+              Ref.get(ingestionState).pipe(
+                Effect.flatMap((state) =>
+                  state === "live"
+                    ? shouldStopProviderEventIngestion
+                    : Effect.succeed(state === "settled"),
+                ),
+              ),
+            ),
             Stream.runDrain,
             Effect.mapError((cause) => new RunExecutionIngestError({ runId: input.run.id, cause })),
             Effect.flatMap(() =>
               Effect.gen(function* () {
                 const terminal = yield* Ref.get(terminalEvent);
                 if (terminal === null) {
+                  if ((yield* Ref.get(ingestionState)) !== "live") {
+                    return;
+                  }
                   // A session release interrupts or fails the stream; a clean
                   // end without a terminal means the run would never settle.
                   return yield* new RunExecutionIngestError({
@@ -1355,58 +1456,13 @@ export const layer: Layer.Layer<
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterruptsOnly(cause),
               (cause) =>
-                Ref.get(rootRunFinalized).pipe(
-                  Effect.flatMap((finalized) =>
-                    Effect.logWarning("orchestration V2 provider event ingestion failed", {
-                      runId: input.run.id,
-                      cause,
-                    }).pipe(
-                      Effect.andThen(
-                        finalized
-                          ? Effect.void
-                          : Ref.get(latestProviderThread).pipe(
-                              Effect.flatMap((providerThread) =>
-                                Ref.get(latestTurnItemOrdinal).pipe(
-                                  Effect.flatMap((latestItemOrdinal) =>
-                                    Ref.get(openRunOwnedSubagents).pipe(
-                                      Effect.flatMap((openSubagents) =>
-                                        writeFinalRunEvents({
-                                          run: input.run,
-                                          rootNode: input.rootNode,
-                                          checkpointScope: input.checkpointScope,
-                                          providerThread,
-                                          attempt: input.attempt,
-                                          writeIfRunCurrent: {
-                                            activeAttemptId: input.attempt.id,
-                                            expectedStatus: "running",
-                                          },
-                                          openRunOwnedSubagents: openSubagents,
-                                          terminal: makeFailedTerminalEvent(
-                                            makeProviderFailure({
-                                              cause: Cause.squash(cause),
-                                              class: "unknown",
-                                            }),
-                                            latestItemOrdinal + 1,
-                                          ),
-                                          failureItemPersisted: false,
-                                          refreshAfterTurn,
-                                        }),
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                              Effect.ensuring(stopOrphanedProviderTurn),
-                            ),
-                      ),
-                      Effect.mapError(
-                        (writeCause) =>
-                          new RunExecutionIngestError({
-                            runId: input.run.id,
-                            cause: { ingest: cause, write: writeCause },
-                          }),
-                      ),
-                    ),
+                Ref.get(ingestionState).pipe(
+                  Effect.flatMap((state) =>
+                    // A dead stream cannot wait for the root turn; a failure
+                    // after the run already failed has nothing left to record.
+                    state === "live"
+                      ? failIngestion(cause).pipe(Effect.andThen(settleIngestionFailure(false)))
+                      : Effect.failCause(cause),
                   ),
                 ),
             ),
@@ -1465,6 +1521,27 @@ export const layer: Layer.Layer<
             yield* Fiber.interrupt(providerEventFiber);
             return;
           }
+          // Ingestion can fail after that check and before the start call. No
+          // provider turn exists yet, so do not start one; a failure handler
+          // still writing learns there is no turn to wait for, one already
+          // waiting is released.
+          const ingestionBeforeStart = yield* Ref.modify(
+            ingestionState,
+            (state): readonly [IngestionState, IngestionState] => [
+              state,
+              state === "failing"
+                ? "failing-start-declined"
+                : state === "awaiting-root-turn"
+                  ? "settled"
+                  : state,
+            ],
+          );
+          if (ingestionBeforeStart !== "live") {
+            if (ingestionBeforeStart === "awaiting-root-turn") {
+              yield* Fiber.interrupt(providerEventFiber);
+            }
+            return;
+          }
 
           const compact =
             input.message.attachments.length === 0 &&
@@ -1482,10 +1559,6 @@ export const layer: Layer.Layer<
               ))
             : input.session.startTurn(turnInput);
           yield* Effect.andThen(shouldStart, startTurn).pipe(
-            // Ingestion can fail between the ownership check and the start
-            // call, or while the call is in flight. Its stop then found no
-            // turn, so the one just started is nobody's.
-            Effect.andThen(Effect.when(stopOrphanedProviderTurn, Ref.get(providerTurnOrphaned))),
             Effect.catchCause((cause) =>
               Effect.logError("orchestration V2 provider turn start failed", {
                 runId: input.run.id,
@@ -1535,6 +1608,18 @@ export const layer: Layer.Layer<
               ),
             ),
           );
+          // Ingestion failed while the start was in flight. The provider names
+          // the turn right after accepting it; a wait past that is a provider
+          // that will never do so, and must not pin the subscription.
+          if ((yield* Ref.get(ingestionState)) !== "live") {
+            yield* Effect.sleep("15 seconds").pipe(
+              Effect.andThen(claimOrphanWatch),
+              Effect.flatMap((claimed) =>
+                claimed ? Fiber.interrupt(providerEventFiber) : Effect.void,
+              ),
+              Effect.forkDetach,
+            );
+          }
         }),
     } satisfies RunExecutionServiceV2Shape);
   }),

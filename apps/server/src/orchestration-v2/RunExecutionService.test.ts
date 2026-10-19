@@ -34,6 +34,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 
@@ -3771,6 +3772,15 @@ const runningRootProviderTurnEvent = (
     },
   }) as ProviderAdapter.ProviderAdapterV2Event;
 
+const rootProviderThreadEvent = (
+  ids: BackgroundScenarioIds,
+): ProviderAdapter.ProviderAdapterV2Event =>
+  ({
+    type: "provider_thread.updated",
+    driver,
+    providerThread: { id: ids.providerThreadId, appThreadId: ids.threadId },
+  }) as ProviderAdapter.ProviderAdapterV2Event;
+
 const failedEventWrite = (input: { readonly providerSessionId: ProviderSessionId }) =>
   Effect.fail(
     new ProviderEventIngestor.ProviderEventPublishError({
@@ -3787,6 +3797,7 @@ it.effect("hard-stops the provider turn when event ingestion fails", () =>
     >([]);
     const { observed } = yield* captureRootRunTermination({
       key: "ingest-failure:interrupt",
+      attemptProviderTurnId: null,
       shouldFinalizeRun: () => Effect.succeed(true),
       events: (ids) =>
         Stream.make(runningRootProviderTurnEvent(ids)).pipe(Stream.concat(Stream.never)),
@@ -3817,22 +3828,23 @@ it.effect("hard-stops the provider turn when event ingestion fails", () =>
 it.effect("leaves no provider turn running when ingestion fails while the turn starts", () =>
   Effect.gen(function* () {
     const startChecked = yield* Deferred.make<void>();
-    const ingestionClosed = yield* Deferred.make<void>();
+    const runFailed = yield* Deferred.make<void>();
     const providerTurnLive = yield* Ref.make(false);
     const startChecks = yield* Ref.make(0);
     const { observed } = yield* captureRootRunTermination({
       key: "ingest-failure:startup-race",
+      attemptProviderTurnId: null,
       shouldFinalizeRun: () => Effect.succeed(true),
       // Preparation checks first. The last check, right before the start call,
-      // still sees a current run; ingestion then fails and finishes its
-      // cleanup before the call goes out.
+      // still sees a current run; ingestion then fails and writes the failed
+      // run end before the call goes out.
       shouldStartProviderTurn: () =>
         Ref.updateAndGet(startChecks, (count) => count + 1).pipe(
           Effect.flatMap((count) =>
             count === 1
               ? Effect.succeed(true)
               : Deferred.succeed(startChecked, undefined).pipe(
-                  Effect.andThen(Deferred.await(ingestionClosed)),
+                  Effect.andThen(Deferred.await(runFailed)),
                   Effect.as(true),
                 ),
           ),
@@ -3840,22 +3852,85 @@ it.effect("leaves no provider turn running when ingestion fails while the turn s
       events: (ids) =>
         Stream.unwrap(
           Deferred.await(startChecked).pipe(
-            Effect.as(
-              Stream.make({
-                type: "provider_thread.updated",
-                driver,
-                providerThread: { id: ids.providerThreadId, appThreadId: ids.threadId },
-              } as ProviderAdapter.ProviderAdapterV2Event).pipe(Stream.concat(Stream.never)),
-            ),
+            Effect.as(Stream.make(rootProviderThreadEvent(ids)).pipe(Stream.concat(Stream.never))),
           ),
         ),
       ingestNormalized: failedEventWrite,
-      onEventSubscriptionClose: Deferred.succeed(ingestionClosed, undefined).pipe(Effect.asVoid),
+      refreshAfterTurn: Deferred.succeed(runFailed, undefined).pipe(Effect.asVoid),
       startTurn: () => Ref.set(providerTurnLive, true),
       interruptTurn: () => Ref.set(providerTurnLive, false),
     });
     assert.deepEqual(observed, ["run:failed", "pull-requests-refreshed"]);
     assert.isFalse(yield* Ref.get(providerTurnLive));
+  }),
+);
+
+it.effect("stops a turn that started while ingestion failed once the provider names it", () =>
+  Effect.gen(function* () {
+    const runFailed = yield* Deferred.make<void>();
+    const providerEvents = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+    const interrupts = yield* Ref.make<
+      ReadonlyArray<ProviderAdapter.ProviderAdapterV2InterruptInput>
+    >([]);
+    const ids = backgroundScenarioIds("ingest-failure:in-flight-start");
+    const { observed } = yield* captureRootRunTermination({
+      key: "ingest-failure:in-flight-start",
+      attemptProviderTurnId: null,
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: () => Stream.fromQueue(providerEvents),
+      ingestNormalized: failedEventWrite,
+      refreshAfterTurn: Deferred.succeed(runFailed, undefined).pipe(Effect.asVoid),
+      // The native start reports the thread before it names the turn. The
+      // thread write fails while the start call is still out, so the only
+      // chance to stop the turn is the turn event that follows.
+      startTurn: () =>
+        Effect.gen(function* () {
+          yield* Queue.offer(providerEvents, rootProviderThreadEvent(ids));
+          yield* Deferred.await(runFailed);
+          yield* Queue.offer(providerEvents, {
+            type: "provider_turn.updated",
+            driver,
+            threadId: ids.threadId,
+            providerTurn: {
+              id: ProviderTurnId.make(`${ids.rootProviderTurnId}:newer`),
+              providerThreadId: ids.providerThreadId,
+              nodeId: ids.rootNodeId,
+              runAttemptId: RunAttemptId.make(`${ids.attemptId}:newer`),
+              status: "running",
+            },
+          } as ProviderAdapter.ProviderAdapterV2Event);
+          yield* Queue.offer(providerEvents, runningRootProviderTurnEvent(ids));
+        }),
+      interruptTurn: (request) => Ref.update(interrupts, (current) => [...current, request]),
+    });
+    assert.deepEqual(observed, ["run:failed", "pull-requests-refreshed"]);
+    assert.deepEqual(
+      (yield* Ref.get(interrupts)).map((request) => ({
+        providerTurnId: request.providerTurnId,
+        requestRuntimeRestart: request.requestRuntimeRestart,
+      })),
+      [{ providerTurnId: ids.rootProviderTurnId, requestRuntimeRestart: true }],
+    );
+  }),
+);
+
+it.effect("leaves the provider turn alone when ingestion fails after the run changed hands", () =>
+  Effect.gen(function* () {
+    const interrupts = yield* Ref.make(0);
+    const { observed } = yield* captureRootRunTermination({
+      key: "ingest-failure:stale-owner",
+      attemptProviderTurnId: null,
+      shouldFinalizeRun: () => Effect.succeed(true),
+      // A user Stop settled the run first, so the failed run end is a no-op
+      // and whatever runs on the provider thread now is not this run's.
+      rejectTerminalWrite: true,
+      events: (ids) =>
+        Stream.make(runningRootProviderTurnEvent(ids)).pipe(Stream.concat(Stream.never)),
+      ingestNormalized: failedEventWrite,
+      interruptTurn: () => Ref.update(interrupts, (count) => count + 1),
+    });
+    assert.deepEqual(observed, []);
+    assert.equal(yield* Ref.get(interrupts), 0);
   }),
 );
 
@@ -3955,6 +4030,8 @@ it.effect("keeps completed runs completed when pull request refresh fails", () =
 
 function captureRootRunTermination(input: {
   readonly key: string;
+  /** A fresh attempt carries no provider turn id; adapters mint it at start. */
+  readonly attemptProviderTurnId?: ProviderTurnId | null;
   readonly shouldFinalizeRun: () => Effect.Effect<boolean, ProjectionStore.ProjectionStoreV2Error>;
   readonly rejectTerminalWrite?: boolean;
   readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
@@ -3969,7 +4046,6 @@ function captureRootRunTermination(input: {
   readonly interruptTurn?: ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptTurn"];
   readonly ingestNormalized?: ProviderEventIngestor.ProviderEventIngestorV2["Service"]["ingestNormalized"];
   readonly refreshAfterTurn?: Effect.Effect<void>;
-  readonly onEventSubscriptionClose?: Effect.Effect<void>;
   readonly shouldStartProviderTurn?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["shouldStartProviderTurn"];
   readonly appContext?: ReturnType<McpAppModelContext.McpAppModelContext["Service"]["forThread"]>;
 }) {
@@ -4091,9 +4167,7 @@ function captureRootRunTermination(input: {
                   : []),
                 rootTerminalEvent(ids, "interrupted"),
               ] satisfies ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>),
-            close: Deferred.succeed(ingestionDone, undefined).pipe(
-              Effect.andThen(input.onEventSubscriptionClose ?? Effect.void),
-            ),
+            close: Deferred.succeed(ingestionDone, undefined),
           }),
           startTurn: input.startTurn ?? (() => Effect.void),
           interruptTurn: input.interruptTurn ?? (() => Effect.void),
@@ -4117,7 +4191,10 @@ function captureRootRunTermination(input: {
         } as OrchestrationV2ProviderThread,
         attempt: {
           id: ids.attemptId,
-          providerTurnId: ids.rootProviderTurnId,
+          providerTurnId:
+            input.attemptProviderTurnId === undefined
+              ? ids.rootProviderTurnId
+              : input.attemptProviderTurnId,
         } as OrchestrationV2RunAttempt,
         attemptId: ids.attemptId,
         providerTurnOrdinal: 1,
