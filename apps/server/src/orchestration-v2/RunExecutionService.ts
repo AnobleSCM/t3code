@@ -1025,12 +1025,12 @@ export const layer: Layer.Layer<
               }
               yield* Ref.set(rootRunFinalized, true);
             });
-          // Failing the run on an ingest error does not end the provider's
-          // turn. Stop it, or it keeps running tools nobody sees, and the
-          // thread's next turn is refused while it is still active. Bounded,
-          // because it runs as a finalizer: a provider that never answers
-          // would otherwise hold the ingestion fiber forever.
+          // Failed ingestion leaves the provider running. Use a hard stop because
+          // a settled Grok prompt can retain background work after a soft interrupt.
+          // Bound the finalizer so an unresponsive provider cannot hold it open.
+          const providerTurnOrphaned = yield* Ref.make(false);
           const stopOrphanedProviderTurn = Effect.gen(function* () {
+            yield* Ref.set(providerTurnOrphaned, true);
             const providerTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
             if (providerTurnId === null) {
               return;
@@ -1038,6 +1038,7 @@ export const layer: Layer.Layer<
             yield* input.session.interruptTurn({
               providerThread: yield* Ref.get(latestProviderThread),
               providerTurnId,
+              requestRuntimeRestart: true,
             });
           }).pipe(
             Effect.timeout("15 seconds"),
@@ -1481,6 +1482,10 @@ export const layer: Layer.Layer<
               ))
             : input.session.startTurn(turnInput);
           yield* Effect.andThen(shouldStart, startTurn).pipe(
+            // Ingestion can fail between the ownership check and the start
+            // call, or while the call is in flight. Its stop then found no
+            // turn, so the one just started is nobody's.
+            Effect.andThen(Effect.when(stopOrphanedProviderTurn, Ref.get(providerTurnOrphaned))),
             Effect.catchCause((cause) =>
               Effect.logError("orchestration V2 provider turn start failed", {
                 runId: input.run.id,
