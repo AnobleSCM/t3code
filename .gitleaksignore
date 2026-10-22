@@ -1,0 +1,6 @@
+# SHA256 fingerprints of opencode-go plus the literal console-key, go-key and inline-key test labels.
+f04546609a0600bd6b878baca0dae75b191f7d35:packages/provider-opencode/src/server/status.test.ts:generic-api-key:124
+f04546609a0600bd6b878baca0dae75b191f7d35:packages/provider-opencode/src/server/status.test.ts:generic-api-key:125
+f04546609a0600bd6b878baca0dae75b191f7d35:packages/provider-opencode/src/server/status.test.ts:generic-api-key:126
+# WebSocket handshake sample nonce, decoded as "the sample nonce".
+863bc0106d47894785daa904a2c9b8eddc46cf9d:apps/server/src/httpResponseErrorGuard.test.ts:generic-api-key:42
