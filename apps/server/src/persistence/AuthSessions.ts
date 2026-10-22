@@ -1,3 +1,4 @@
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -416,6 +417,7 @@ export const make = Effect.gen(function* () {
 
   const getById: AuthSessionRepository["Service"]["getById"] = (input) =>
     getSessionRowById(input).pipe(
+      NodeSqliteClient.readOnly,
       Effect.mapError(
         toPersistenceSqlOrDecodeError(
           "AuthSessionRepository.getById:query",
