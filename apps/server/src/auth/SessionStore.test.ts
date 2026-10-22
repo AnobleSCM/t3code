@@ -67,7 +67,7 @@ const makeDiskSessionStoreLayer = Effect.fn("makeDiskSessionStoreLayer")(functio
   yield* ServerConfig.ensureServerDirectories(paths);
   const layerPersistence = SqlitePersistence.layerFromPath(paths.dbPath);
   return SessionStore.layer.pipe(
-    Layer.provide(layerPersistence),
+    Layer.provideMerge(layerPersistence),
     Layer.provide(ServerSecretStore.layer),
     Layer.provide(layerServerEnvironment(EnvironmentId.make(baseDir))),
     Layer.provide(
@@ -83,6 +83,48 @@ const makeDiskSessionStoreLayer = Effect.fn("makeDiskSessionStoreLayer")(functio
 });
 
 it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
+  it.effect("verifies sessions during unrelated writes and observes committed revocations", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-auth-contention-" });
+      const diskLayer = yield* makeDiskSessionStoreLayer(baseDir);
+      yield* Effect.gen(function* () {
+        const sessions = yield* SessionStore.SessionStore;
+        const sql = yield* SqlClient.SqlClient;
+        const client = yield* sessions.issue({ subject: "concurrent-client" });
+        const ticket = yield* sessions.issueWebSocketToken(client.sessionId);
+        yield* sql`CREATE TABLE unrelated_writes (value INTEGER)`;
+        const writerReady = yield* Deferred.make<void>();
+        const releaseWriter = yield* Deferred.make<void>();
+        const writer = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* sql`INSERT INTO unrelated_writes VALUES (1)`;
+              yield* Deferred.succeed(writerReady, undefined);
+              yield* Deferred.await(releaseWriter);
+            }),
+          )
+          .pipe(Effect.forkScoped({ startImmediately: true }));
+        yield* Deferred.await(writerReady);
+        // Verification must finish before the unrelated transaction can commit.
+        yield* Effect.gen(function* () {
+          expect((yield* sessions.verify(client.token)).sessionId).toBe(client.sessionId);
+          expect((yield* sessions.verifyWebSocketToken(ticket.token)).sessionId).toBe(
+            client.sessionId,
+          );
+        }).pipe(Effect.ensuring(Deferred.succeed(releaseWriter, undefined)));
+        yield* Fiber.join(writer);
+        yield* sessions.revoke(client.sessionId);
+        expect((yield* sessions.verify(client.token).pipe(Effect.flip))._tag).toBe(
+          "SessionTokenRevokedError",
+        );
+        expect((yield* sessions.verifyWebSocketToken(ticket.token).pipe(Effect.flip))._tag).toBe(
+          "WebSocketSessionRevokedError",
+        );
+      }).pipe(Effect.scoped, Effect.provide(diskLayer));
+    }).pipe(Effect.scoped),
+  );
+
   it.effect.each(["revoke", "revokeAllExcept", "replace"] as const)(
     "invalidates every connection for a session on %s and leaves other sessions active",
     (operation) =>
