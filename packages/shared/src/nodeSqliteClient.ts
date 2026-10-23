@@ -485,7 +485,7 @@ const readSafeSqliteInteger = (value: unknown) => {
 const checkpointWorkerSource = `
 const { parentPort, workerData } = require("node:worker_threads");
 const { DatabaseSync } = require("node:sqlite");
-const { statSync } = require("node:fs");
+const { closeSync, fsyncSync, openSync, statSync } = require("node:fs");
 let db;
 let frames;
 let checkpoint;
@@ -530,6 +530,17 @@ const check = (id, nextJournalSizeLimit, force, nextGeneration = generation) => 
     // A reader's snapshot stopped the backfill; holding writes cannot let it catch up.
     pinned = result.checkpointed < result.log;
     state = frames.get();
+  }
+  // No checkpoint syncs frames a reader pins, and synchronous = NORMAL leaves them unsynced.
+  // shortcut: plain fsync (Node has no F_FULLFSYNC), so a macOS power loss can still drop
+  // them until the reader closes; bounds OS-crash loss only.
+  if (pinned) {
+    const fd = openSync(workerData.filename + "-wal", "r");
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
   }
   if (state.checkpointed === state.log && (atCeiling(state) || oversized)) {
     pendingTruncate = { truncateId: ++nextTruncateId, checkId: id, generation, state };
