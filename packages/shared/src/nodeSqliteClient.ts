@@ -496,6 +496,7 @@ let nextTruncateId = 0;
 let pendingTruncate;
 let pendingBarriers = 0;
 let idle;
+let syncedStamp;
 const initialize = () => {
   if (db !== undefined) return;
   // The writer switches to WAL after constructing the client.
@@ -532,14 +533,20 @@ const check = (id, nextJournalSizeLimit, force, nextGeneration = generation) => 
     state = frames.get();
   }
   // No checkpoint syncs frames a reader pins, and synchronous = NORMAL leaves them unsynced.
-  // shortcut: plain fsync (Node has no F_FULLFSYNC), so a macOS power loss can still drop
-  // them until the reader closes; bounds OS-crash loss only.
+  // On macOS libuv's fsync uses F_FULLFSYNC, as SQLite's checkpoints do; skip it if unchanged.
   if (pinned) {
-    const fd = openSync(workerData.filename + "-wal", "r");
-    try {
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
+    const wal = workerData.filename + "-wal";
+    const stamp = state.log + ":" + statSync(wal).mtimeMs;
+    if (stamp !== syncedStamp) {
+      // Windows needs write access to flush. SQLite takes no POSIX locks on -wal, so closing
+      // this fd releases none of the writer's.
+      const fd = openSync(wal, "r+");
+      try {
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      syncedStamp = stamp;
     }
   }
   if (state.checkpointed === state.log && (atCeiling(state) || oversized)) {
