@@ -2000,8 +2000,28 @@ layer("ProviderEventIngestorV2", (it) => {
       }),
   );
 
-  it.effect("moves a native subagent's thread to the model its provider reports later", () =>
-    Effect.gen(function* () {
+  it.effect("retries a native subagent's reported model update after a database lock", () => {
+    let primaryWrites = 0;
+    let modelWriteAttempts = 0;
+    const ingestorSink = Layer.effect(
+      EventSink.EventSinkV2,
+      Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        return EventSink.EventSinkV2.of({
+          ...eventSink,
+          write: (input) =>
+            Effect.suspend(() => {
+              if (input.events.some((event) => event.type === "subagent.updated")) primaryWrites++;
+              if (input.events.some((event) => event.type === "thread.model-selection-updated")) {
+                modelWriteAttempts++;
+                if (modelWriteAttempts <= 2) return lockTimeout;
+              }
+              return eventSink.write(input);
+            }),
+        });
+      }),
+    ).pipe(Layer.provide(layerTestEventSink));
+    return Effect.gen(function* () {
       const now = yield* DateTime.now;
       const eventSink = yield* EventSink.EventSinkV2;
       const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
@@ -2073,6 +2093,8 @@ layer("ProviderEventIngestorV2", (it) => {
       } satisfies ProviderEventIngestor.ProviderEventIngestInput["event"];
 
       const first = yield* ingest(subagentUpdated);
+      assert.equal(primaryWrites, 1);
+      assert.equal(modelWriteAttempts, 3);
       const repeated = yield* ingest(subagentUpdated);
       const childThread = yield* projectionStore.getThread(childThreadId);
 
@@ -2119,8 +2141,8 @@ layer("ProviderEventIngestorV2", (it) => {
         (yield* projectionStore.getThread(childThreadId)).modelSelection,
         reportedSelection,
       );
-    }),
-  );
+    }).pipe(Effect.provide(Layer.fresh(makeLayerTest(ingestorSink))));
+  });
 });
 
 // EventSink reports a lock that outlasted busy_timeout at BEGIN IMMEDIATE this way.
