@@ -59,7 +59,7 @@ const PROVIDER_FAILURE_REASONS: Record<ProviderAdapterFailureReason, string> = {
 
 /**
  * Walks a cause chain for curated text without reading arbitrary provider
- * defect text. `known` is the message of a domain error T3 raised itself;
+ * defect text. `known` is a domain message or a redacted ACP exit diagnostic;
  * `category` is the generic message of the innermost provider wrapper seen.
  */
 function curatedCauseMessages(cause: unknown): {
@@ -184,11 +184,11 @@ function redactProviderFailureText(value: string): string {
     .replace(/\bhttps?:\/\/[^\s<>"']+/giu, redactUrl)
     .replace(/\b(Bearer|Basic)\s+[^\s,;]+/giu, "$1 [REDACTED]")
     .replace(
-      /(["'](?:access[_-]?token|api[_-]?key|authorization|credential|password|secret|token)["']\s*:\s*["'])[^"']*(["'])/giu,
-      "$1[REDACTED]$2",
+      /(["'](?:[A-Za-z0-9]+[_-])*(?:access[_-]?token|api[_-]?key|private[_-]?key|authorization|credential|password|secret|token)["']\s*:\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/giu,
+      '$1"[REDACTED]"',
     )
     .replace(
-      /(\b(?:access[_-]?token|api[_-]?key|authorization|credential|password|secret|token)\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu,
+      /(\b(?:[A-Za-z0-9]+[_-])*(?:access[_-]?token|api[_-]?key|private[_-]?key|authorization|credential|password|secret|token)\b\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)/giu,
       "$1[REDACTED]",
     )
     .replace(/\bsk-[A-Za-z0-9_-]{16,}\b/gu, "[REDACTED]")

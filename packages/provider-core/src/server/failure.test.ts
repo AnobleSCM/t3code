@@ -80,6 +80,33 @@ it("keeps structured ACP exit details through cause wrappers without reading arb
   );
 });
 
+it("redacts prefixed credential fields and escaped quoted values in ACP stderr", () => {
+  const stderr = [
+    "Synthetic failure: MISTRAL_API_KEY=FixtureOnly0123456789abcdefABCDEF",
+    "GEMINI_API_KEY=AIzaFixtureOnly0123456789",
+    JSON.stringify({
+      refresh_token: "fixture-refresh-value",
+      client_secret: "fixture-client-secret",
+      private_key: "-----BEGIN PRIVATE KEY-----\nFIXTURE",
+      token: 'fixture"secret-tail',
+    }),
+  ].join("\n");
+  const failure = makeProviderFailure({
+    cause: { _tag: "AcpProcessExitedError", code: 23, stderr },
+  });
+  assert.include(failure.message, "Synthetic failure:");
+  for (const value of [
+    "FixtureOnly",
+    "AIzaFixture",
+    "fixture-refresh",
+    "fixture-client",
+    "FIXTURE",
+    "secret-tail",
+  ]) {
+    assert.notInclude(failure.message, value);
+  }
+});
+
 it("redacts standalone service tokens in ACP exit diagnostics", () => {
   const failure = makeProviderFailure({
     cause: {
