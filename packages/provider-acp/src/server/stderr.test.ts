@@ -27,6 +27,15 @@ describe("AcpStderr", () => {
     expect(excerpt).not.toContain("sk-abcdefghijklmnopqrstuv");
   });
 
+  it("redacts complete API keys whose synthetic bodies contain underscores", () => {
+    const excerpt = sanitizeAcpStderrExcerpt(
+      "openai=sk-proj-fixture_abc_def_0123456789\nanthropic=sk-ant-api03-fixture_abc_def_0123456789-AA",
+      "fixture-home",
+      {},
+    );
+    expect(excerpt).toBe("openai=[redacted]\nanthropic=[redacted]");
+  });
+
   it("redacts hyphenated OpenAI project keys and header credentials", () => {
     const excerpt = sanitizeAcpStderrExcerpt(
       [

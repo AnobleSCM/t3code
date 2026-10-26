@@ -40,6 +40,85 @@ it("redacts credentials and URL secrets from provider failures", () => {
   assert.notInclude(failure.message, "sk-abcdefghijklmnop");
 });
 
+it("keeps structured ACP exit details through cause wrappers without reading arbitrary messages", () => {
+  const cause = {
+    _tag: "AcpProcessExitedError",
+    code: 23,
+    stderr: "Synthetic configuration failed.\napi_key=fixture-only-key",
+    message: "Untrusted alternative message",
+  };
+  for (const value of [
+    cause,
+    Cause.fail(cause),
+    { _tag: "ProviderAdapterTurnStartError", cause },
+  ]) {
+    const failure = makeProviderFailure({ cause: value, class: "provider_error" });
+    assert.equal(failure.code, "23");
+    assert.equal(
+      failure.message,
+      "ACP process exited with code 23\nSynthetic configuration failed.\napi_key=[REDACTED]",
+    );
+  }
+  assert.equal(
+    makeProviderFailure({ cause, message: "Explicit failure", code: "explicit" }).message,
+    "Explicit failure",
+  );
+  assert.equal(makeProviderFailure({ cause, code: "explicit" }).code, "explicit");
+  assert.equal(
+    makeProviderFailure({ cause: { _tag: "AcpProcessExitedError", signal: "SIGTERM" } }).message,
+    "ACP process exited after signal SIGTERM",
+  );
+  assert.equal(
+    makeProviderFailure({ cause: { _tag: "AcpProcessExitedError", signal: "SIGTERM" } }).code,
+    "SIGTERM",
+  );
+  assert.equal(
+    makeProviderFailure({
+      cause: { _tag: "AcpProcessExitedError", code: NaN, signal: "unsafe signal" },
+    }).message,
+    "ACP process exited",
+  );
+});
+
+it("redacts standalone service tokens in ACP exit diagnostics", () => {
+  const failure = makeProviderFailure({
+    cause: {
+      _tag: "AcpProcessExitedError",
+      code: 23,
+      stderr: "Synthetic failure: ghp_fixture0123456789 xoxb-fixture-0123456789",
+    },
+  });
+  assert.equal(
+    failure.message,
+    "ACP process exited with code 23\nSynthetic failure: [REDACTED] [REDACTED]",
+  );
+});
+
+it("redacts before bounding the tail of ACP exit diagnostics", () => {
+  const failure = makeProviderFailure({
+    cause: {
+      _tag: "AcpProcessExitedError",
+      code: 23,
+      stderr: `api_key=${"fixturecredential".repeat(600)}\n${"old diagnostic\n".repeat(600)}Final synthetic diagnostic.`,
+    },
+  });
+  assert.isAtMost(failure.message.length, MAX_PROVIDER_FAILURE_MESSAGE_LENGTH);
+  assert.isTrue(failure.message.startsWith("ACP process exited with code 23\n…"));
+  assert.isTrue(failure.message.endsWith("Final synthetic diagnostic."));
+  assert.notInclude(failure.message, "fixturecredential");
+});
+
+it("does not split a surrogate pair at the start of an ACP stderr tail", () => {
+  for (const suffix of ["Final.", "Final.!"]) {
+    const failure = makeProviderFailure({
+      cause: { _tag: "AcpProcessExitedError", code: 23, stderr: `${"🚀".repeat(3_000)}${suffix}` },
+    });
+    assert.isAtMost(failure.message.length, MAX_PROVIDER_FAILURE_MESSAGE_LENGTH);
+    assert.notMatch(failure.message, /[\uD800-\uDFFF]/u);
+    assert.isTrue(failure.message.endsWith(suffix));
+  }
+});
+
 it("does not split a surrogate pair at the truncation boundary", () => {
   const failure = makeProviderFailure({
     message: `${"a".repeat(MAX_PROVIDER_FAILURE_MESSAGE_LENGTH - 2)}🚀tail`,
