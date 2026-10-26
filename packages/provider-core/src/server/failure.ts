@@ -184,11 +184,11 @@ function redactProviderFailureText(value: string): string {
     .replace(/\bhttps?:\/\/[^\s<>"']+/giu, redactUrl)
     .replace(/\b(Bearer|Basic)\s+[^\s,;]+/giu, "$1 [REDACTED]")
     .replace(
-      /(["'](?:[A-Za-z0-9]+[_-])*(?:access[_-]?token|api[_-]?key|private[_-]?key|authorization|credential|password|secret|token)["']\s*:\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/giu,
-      '$1"[REDACTED]"',
+      /(["'](?:access[_-]?token|api[_-]?key|authorization|credential|password|secret|token)["']\s*:\s*["'])[^"']*(["'])/giu,
+      "$1[REDACTED]$2",
     )
     .replace(
-      /(\b(?:[A-Za-z0-9]+[_-])*(?:access[_-]?token|api[_-]?key|private[_-]?key|authorization|credential|password|secret|token)\b\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)/giu,
+      /(\b(?:access[_-]?token|api[_-]?key|authorization|credential|password|secret|token)\b\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu,
       "$1[REDACTED]",
     )
     .replace(/\bsk-[A-Za-z0-9_-]{16,}\b/gu, "[REDACTED]")
@@ -210,7 +210,19 @@ function acpProcessExitDiagnostic(error: Record<string, unknown>) {
     : code === undefined
       ? "ACP process exited"
       : `ACP process exited with code ${code}`;
-  const stderr = typeof error.stderr === "string" ? redactProviderFailureText(error.stderr) : "";
+  const stderr =
+    typeof error.stderr === "string"
+      ? redactProviderFailureText(error.stderr)
+          .split(/\r\n?|\n/u)
+          .map((line) =>
+            /token|secret|pass(?:word|wd)|credential|authorization|key/u.test(
+              line.normalize("NFKC").toLowerCase(),
+            )
+              ? "[REDACTED credential diagnostic]"
+              : line,
+          )
+          .join("\n")
+      : "";
   const available = MAX_PROVIDER_FAILURE_MESSAGE_LENGTH - summary.length - 1;
   let start = Math.max(0, stderr.length - available + 1);
   if (start > 0 && /[\uDC00-\uDFFF]/u.test(stderr[start] ?? "")) start += 1;

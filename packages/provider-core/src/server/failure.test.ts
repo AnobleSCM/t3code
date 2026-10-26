@@ -56,7 +56,7 @@ it("keeps structured ACP exit details through cause wrappers without reading arb
     assert.equal(failure.code, "23");
     assert.equal(
       failure.message,
-      "ACP process exited with code 23\nSynthetic configuration failed.\napi_key=[REDACTED]",
+      "ACP process exited with code 23\nSynthetic configuration failed.\n[REDACTED credential diagnostic]",
     );
   }
   assert.equal(
@@ -82,7 +82,8 @@ it("keeps structured ACP exit details through cause wrappers without reading arb
 
 it("redacts prefixed credential fields and escaped quoted values in ACP stderr", () => {
   const stderr = [
-    "Synthetic failure: MISTRAL_API_KEY=FixtureOnly0123456789abcdefABCDEF",
+    "Synthetic configuration failed.",
+    "MISTRAL_API_KEY=FixtureOnly0123456789abcdefABCDEF",
     "GEMINI_API_KEY=AIzaFixtureOnly0123456789",
     JSON.stringify({
       refresh_token: "fixture-refresh-value",
@@ -94,7 +95,7 @@ it("redacts prefixed credential fields and escaped quoted values in ACP stderr",
   const failure = makeProviderFailure({
     cause: { _tag: "AcpProcessExitedError", code: 23, stderr },
   });
-  assert.include(failure.message, "Synthetic failure:");
+  assert.include(failure.message, "Synthetic configuration failed.");
   for (const value of [
     "FixtureOnly",
     "AIzaFixture",
@@ -104,6 +105,33 @@ it("redacts prefixed credential fields and escaped quoted values in ACP stderr",
     "secret-tail",
   ]) {
     assert.notInclude(failure.message, value);
+  }
+});
+
+it("withholds whole ACP stderr lines containing credential markers", () => {
+  for (const line of [
+    "AWS_SECRET_ACCESS_KEY=FixtureOnlyValue0123",
+    "SECRET_KEY=FixtureOnlyValue0123",
+    "STRIPE_SECRET_KEY=FixtureOnlyValue0123",
+    JSON.stringify({ clientSecret: "fixture-client-value", refreshToken: "fixture-refresh-value" }),
+    "secretAccessKey: FixtureOnlyValue",
+    "Authorization: token FixtureOnlyValue",
+    "Diagnostic only mentions a password; no value is present.",
+    "CLIENTSECRET=FixtureOnlyValue",
+    "GOOGLE_KEY=FixtureOnlyValue",
+    "Unknown configuration key; no credential is present.",
+  ]) {
+    const failure = makeProviderFailure({
+      cause: {
+        _tag: "AcpProcessExitedError",
+        code: 23,
+        stderr: `Synthetic configuration failed.\n${line}\nFinal diagnostic.`,
+      },
+    });
+    assert.equal(
+      failure.message,
+      "ACP process exited with code 23\nSynthetic configuration failed.\n[REDACTED credential diagnostic]\nFinal diagnostic.",
+    );
   }
 });
 
