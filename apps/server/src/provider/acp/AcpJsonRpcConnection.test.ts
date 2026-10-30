@@ -364,13 +364,20 @@ describe("AcpSessionRuntime", () => {
   it.effect.each([
     {
       name: "a final diagnostic",
+      prefix: "api_key=",
       suffix: "\nFinal synthetic crash diagnostic.",
-      expected: "Final synthetic crash diagnostic.",
+      expected: undefined,
     },
-    { name: "no complete line", suffix: "", expected: undefined },
+    { name: "no complete line", prefix: "api_key=", suffix: "", expected: undefined },
+    {
+      name: "a clipped private-key header",
+      prefix: "-----BEGIN PRIVATE KEY-----\n",
+      suffix: "\n-----END PRIVATE KEY-----",
+      expected: undefined,
+    },
   ])("omits a credential cut by the stderr tail boundary with $name", (testCase) =>
     Effect.gen(function* () {
-      const stderr = `api_key=${"fixturecredential".repeat(600)}${testCase.suffix}`;
+      const stderr = `${testCase.prefix}${"fixturecredential".repeat(600)}${testCase.suffix}`;
       const runtime = yield* AcpSessionRuntime.make({
         ...mockRuntimeOptions,
         spawn: {

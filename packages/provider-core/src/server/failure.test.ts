@@ -136,17 +136,32 @@ it("withholds whole ACP stderr lines containing credential markers", () => {
   }
 });
 
+it("withholds multiline private-key bodies, including unterminated keys", () => {
+  for (const end of ["-----END PRIVATE KEY-----", ""]) {
+    const failure = makeProviderFailure({
+      cause: {
+        _tag: "AcpProcessExitedError",
+        code: 23,
+        stderr: `Synthetic configuration failed.\n-----BEGIN PRIVATE KEY-----\nZml4dHVyZS1wcml2YXRlLWJvZHk=\n${end}`,
+      },
+    });
+    assert.include(failure.message, "ACP process exited with code 23");
+    assert.notInclude(failure.message, "Zml4dHVyZS1wcml2YXRlLWJvZHk=");
+  }
+});
+
 it("redacts standalone service tokens in ACP exit diagnostics", () => {
   const failure = makeProviderFailure({
     cause: {
       _tag: "AcpProcessExitedError",
       code: 23,
-      stderr: "Synthetic failure: ghp_fixture0123456789 xoxb-fixture-0123456789",
+      stderr:
+        "Synthetic failure: ghp_fixture0123456789 xoxb-fixture-0123456789 github_pat_fixture_123 gho_fixture123 ghu_fixture123 ghs_fixture123 ghr_fixture123",
     },
   });
   assert.equal(
     failure.message,
-    "ACP process exited with code 23\nSynthetic failure: [REDACTED] [REDACTED]",
+    "ACP process exited with code 23\nSynthetic failure: [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED]",
   );
 });
 

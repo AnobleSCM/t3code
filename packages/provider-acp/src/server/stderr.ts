@@ -6,7 +6,7 @@ const BEARER_TOKEN_PATTERN = /\bBearer\s+[A-Za-z0-9._\-+=/]+/gi;
 const BASIC_AUTH_PATTERN = /\bAuthorization:\s*Basic\s+\S+/gi;
 const API_KEY_HEADER_PATTERN = /\bx-api-key:\s*\S+/gi;
 const SECRET_TOKEN_PATTERN =
-  /\b(?:sk-[A-Za-z0-9][A-Za-z0-9_-]{7,}|ghp_[A-Za-z0-9]+|xox[a-zA-Z]-[A-Za-z0-9-]+)\b/g;
+  /\b(?:sk-[A-Za-z0-9][A-Za-z0-9_-]{7,}|github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9]+|xox[a-zA-Z]-[A-Za-z0-9-]+)\b/g;
 
 export function appendAcpStderrTail(current: string, chunk: string): string {
   const next = `${current}${chunk}`;
@@ -18,7 +18,9 @@ export function sanitizeAcpStderrExcerpt(
   homeDirectory: string,
   environment: NodeJS.ProcessEnv = process.env,
 ): string {
-  let result = text.replaceAll("\0", "");
+  let result = text
+    .replaceAll("\0", "")
+    .replace(/-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*/giu, "[redacted private key]");
   const homes = [environment.HOME, environment.USERPROFILE, homeDirectory].filter(
     (value): value is string => typeof value === "string" && value.length > 1,
   );

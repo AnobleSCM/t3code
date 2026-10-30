@@ -196,6 +196,7 @@ function replaceUnsafeControlCharacters(value: string): string {
 
 function redactProviderFailureText(value: string): string {
   return replaceUnsafeControlCharacters(value)
+    .replace(/-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*/giu, "[REDACTED private key]")
     .replace(/\bhttps?:\/\/[^\s<>"']+/giu, redactUrl)
     .replace(/\b(Bearer|Basic)\s+[^\s,;]+/giu, "$1 [REDACTED]")
     .replace(
@@ -207,7 +208,10 @@ function redactProviderFailureText(value: string): string {
       "$1[REDACTED]",
     )
     .replace(/\bsk-[A-Za-z0-9_-]{16,}\b/gu, "[REDACTED]")
-    .replace(/\b(?:ghp_[A-Za-z0-9]+|xox[a-zA-Z]-[A-Za-z0-9-]+)\b/gu, "[REDACTED]")
+    .replace(
+      /\b(?:github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9]+|xox[a-zA-Z]-[A-Za-z0-9-]+)\b/gu,
+      "[REDACTED]",
+    )
     .trim();
 }
 

@@ -1298,14 +1298,11 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
           Effect.ignore,
           Effect.andThen(Ref.get(stderrTailRef)),
           Effect.map((tail) => {
-            // A clipped first line can contain a credential whose identifying prefix was discarded.
-            const completeTail =
+            // A capped tail can start inside a multiline credential whose header was discarded.
+            const stderr =
               tail.length < ACP_STDERR_TAIL_MAX_CHARS
-                ? tail
-                : tail.includes("\n")
-                  ? tail.slice(tail.indexOf("\n") + 1)
-                  : "";
-            const stderr = sanitizeAcpStderrExcerpt(completeTail, homeDirectory);
+                ? sanitizeAcpStderrExcerpt(tail, homeDirectory)
+                : "";
             return stderr.length === 0
               ? error
               : new EffectAcpErrors.AcpProcessExitedError({
