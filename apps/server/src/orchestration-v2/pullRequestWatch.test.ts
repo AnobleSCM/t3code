@@ -139,6 +139,40 @@ describe("evaluatePullRequestWatch", () => {
     assert.deepEqual(evaluatePullRequestWatch(first.next, both, noRemarks).changes, []);
   });
 
+  it("does not report passed when every check was skipped", () => {
+    const skipped = detail({
+      checks: [check("a", "skipped"), check("b", "skipped"), check("c", "neutral")],
+    });
+    const report = evaluatePullRequestWatch(watch(), skipped, noRemarks);
+    assert.deepEqual(report.changes, []);
+    assert.equal(report.next.passed, false);
+
+    const ran = detail({ checks: [check("a", "success"), check("b", "skipped")] });
+    assert.deepEqual(evaluatePullRequestWatch(report.next, ran, noRemarks).changes, [
+      { kind: "checks-passed", count: 1, required: false },
+    ]);
+  });
+
+  it("counts only the checks that succeeded when some were skipped", () => {
+    const mixed = detail({
+      checks: [check("a", "success"), check("b", "success"), check("c", "skipped")],
+    });
+    assert.deepEqual(evaluatePullRequestWatch(watch(), mixed, noRemarks).changes, [
+      { kind: "checks-passed", count: 2, required: false },
+    ]);
+
+    const required = (name: string, status: PullRequestCheck["status"]) => ({
+      ...check(name, status),
+      required: true,
+    });
+    const gated = detail({ checks: [required("Tests", "success"), required("Docs", "skipped")] });
+    assert.deepEqual(evaluatePullRequestWatch(watch(), gated, noRemarks).changes, [
+      { kind: "checks-passed", count: 1, required: true },
+    ]);
+    const onlySkipped = detail({ checks: [required("Docs", "skipped"), check("lint", "success")] });
+    assert.deepEqual(evaluatePullRequestWatch(watch(), onlySkipped, noRemarks).changes, []);
+  });
+
   it("does not wake a watch saved before passed checks were recorded", () => {
     const green = detail({ checks: [{ ...check("test", "success"), required: true }] });
     const told = watch({ headSha: "aaaaaaaaaa", passed: true });
